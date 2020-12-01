@@ -190,6 +190,8 @@ type PxQuery struct {
 	Ratings map[ID]float64
 	MaxVisitsPerWalk int
 	MaxTotalVisits int
+	ReturnPosts bool
+	ReturnTags bool
 	centrality map[ID]float64
 }
 
@@ -272,7 +274,7 @@ func (px *PxQuery) SampleWalkLengths(g PxGraph) (stepCounts map[ID]float64) {
 }
 
 // TODO: early stopping
-func (px *PxQuery) RunAgainst(g PxGraph, postsOnly bool) (recommendations map[ID]float64) {
+func (px *PxQuery) RunAgainst(g PxGraph) (recommendations map[ID]float64) {
 	defer func() {
 		px.centrality = nil
 	}()
@@ -283,8 +285,11 @@ func (px *PxQuery) RunAgainst(g PxGraph, postsOnly bool) (recommendations map[ID
 		visits := make(map[ID]float64, int(expectedResults * 1.5))
 		for i := 0; i < int(stepc); i++ {
 			q = px.PersonalizedNeighbor(q, g).ID()
-			if (postsOnly && q.IDType != idTypePost) {
+			if (!px.ReturnTags && q.IDType != idTypePost) {
 			 	q = px.PersonalizedNeighbor(q, g).ID()
+			}
+			if (!px.ReturnPosts && q.IDType != idTypeTag) {
+				q = px.PersonalizedNeighbor(q, g).ID()
 			}
 			if _, ok := visits[q]; !ok {
 				visits[q] = 0
