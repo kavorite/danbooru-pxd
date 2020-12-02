@@ -2,12 +2,20 @@ package main
 
 import (
 	"context"
+	"compress/gzip"
+	"encoding/json"
+	"bufio"
+	"time"
+	"io"
 
 	bq "cloud.google.com/go/bigquery"
+	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
 )
 
-type IDType int
+type IDType uint8
+type IDValue int
+type TagType string
 
 const (
 	idTypeTag = 0
@@ -15,11 +23,9 @@ const (
 )
 
 type ID struct {
-	Value int
+	IDValue
 	IDType
 }
-
-type TagType int
 
 type Node interface {
 	ID() ID
@@ -27,9 +33,9 @@ type Node interface {
 }
 
 type Tag struct {
-	id int
-	Name string
-	TagType
+	id IDValue      `json:"id"`
+	Name string     `json:"name"`
+	TagType         `json:"category"`
 }
 
 func (tag *Tag) ID() ID {
@@ -37,8 +43,8 @@ func (tag *Tag) ID() ID {
 }
 
 type Post struct {
-	id int
-	Tags []Tag
+	id IDValue `json:"id"`
+	Tags []Tag `json:"tags"`
 }
 
 func (post *Post) ID() ID {
@@ -73,7 +79,7 @@ func (post PostNode) Neighbors() (neighbors []Node) {
 
 type BiGraph map[ID]Node
 
-func (bigraph BiGraph) TagEdges(id int) (*TagNode, bool) {
+func (bigraph BiGraph) TagEdges(id IDValue) (*TagNode, bool) {
 	node, ok := bigraph[ID{id, idTypeTag}]
 	if !ok {
 		return nil, false
@@ -81,7 +87,7 @@ func (bigraph BiGraph) TagEdges(id int) (*TagNode, bool) {
 	return node.(*TagNode), true
 }
 
-func (bigraph BiGraph) PostEdges(id int) (*PostNode, bool) {
+func (bigraph BiGraph) PostEdges(id IDValue) (*PostNode, bool) {
 	node, ok := bigraph[ID{id, idTypePost}]
 	if !ok {
 		return nil, false
@@ -93,6 +99,29 @@ func (bigraph *BiGraph) Load(ctx context.Context) *Error {
 	client, err := bq.NewClient(ctx, projectID)
 	if err := wrapError("init BigQuery client", err); err != nil {
 		return err
+	}
+	gcs, err := storage.NewClient(ctx)
+	if err := wrapError("init GCS client", err); err != nil {
+		return err
+	}
+	// check when the tags were last modified
+	bkt := gcs.Bucket("danbooru-px-tags")
+	attr, err := bkt.Objects(ctx, &storage.Query{Prefix: "tags-"}).Next()
+	if err := wrapError("check data freshness", err); err != nil {
+		return err
+	}
+	var extraction *bq.Job
+	if time.Now().Sub(attr.Updated) >= time.Hour * 25 {
+		gcsRef := bq.NewGCSReference("gs://danbooru-px-tags/tags-*")
+		gcsRef.Compression = bq.Gzip
+		gcsRef.DestinationFormat = bq.JSON
+		extractor := client.Dataset("danbooru_post_tags").Table("taggings").ExtractorTo(gcsRef)
+		extractor.DisableHeader = true
+		var err error
+		extraction, err = extractor.Run(ctx)
+		if err := wrapError("extract table data", err); err != nil {
+			return err
+		}
 	}
 	var g BiGraph
 	if bigraph == nil {
@@ -110,29 +139,61 @@ func (bigraph *BiGraph) Load(ctx context.Context) *Error {
 		bigraph = &g
 	}
 	g = *bigraph
-	q := client.Query("SELECT * FROM `danbooru-px.danbooru_post_tags.taggings`")
-	it, err := q.Read(ctx)
-	if err != nil && err != iterator.Done {
-		return wrapError("hydrate post labels", err)
+	// hurry up and wait for extraction to complete
+	if extraction != nil {
+		for {
+			<-time.After(time.Second*10)
+			status, err := extraction.Status(ctx)
+			if err := wrapError("extract table data: poll job status", err); err != nil {
+				return err
+			}
+			if status.State != bq.Done {
+				continue
+			}
+			if len(status.Errors) != 0 {
+				return wrapError("extract table data", status.Errors[len(status.Errors)-1])
+			}
+			break
+		}
 	}
-	for {
+	// pull our archives out of storage
+	for it := bkt.Objects(ctx, &storage.Query{Prefix: "tags-"});; {
+		attr, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err := wrapError("resolve exported JSON blob handle", err); err != nil {
+			return err
+		}
+		blob := bkt.Object(attr.Name)
+		var istrm io.ReadCloser
+		istrm, err = blob.NewReader(ctx)
+		if err := wrapError("hydrate exported data", err); err != nil {
+			return err
+		}
+		defer istrm.Close()
+		istrm, err = gzip.NewReader(istrm)
+		if err := wrapError("hydrate exported data", err); err != nil {
+			return err
+		}
 		var post Post
-		if err := it.Next(&post); err != nil {
-			if err != iterator.Done {
-				return wrapError("hydrate post labels", err)
+		for sc := bufio.NewScanner(istrm); sc.Scan(); {
+			err := wrapError("hydrate exported data", json.Unmarshal(sc.Bytes(), &post))
+			if err != nil {
+				return err
 			}
-			return nil
-		}
-		postNode := &PostNode{Post: post}
-		postNode.neighbors = make(map[ID]*TagNode, 128)
-		g[postNode.ID()] = postNode
-		for _, tag := range post.Tags {
-			if _, ok := g[tag.ID()].(*TagNode); !ok {
-				neighbors := make(map[ID]*PostNode, 1<<20)
-				g[tag.ID()] = &TagNode{tag, neighbors}
+			postNode := &PostNode{Post: post}
+			postNode.neighbors = make(map[ID]*TagNode, 128)
+			g[postNode.ID()] = postNode
+			for _, tag := range post.Tags {
+				if _, ok := g[tag.ID()].(*TagNode); !ok {
+					neighbors := make(map[ID]*PostNode, 1<<20)
+					g[tag.ID()] = &TagNode{tag, neighbors}
+				}
+				g[tag.ID()].(*TagNode).neighbors[postNode.ID()] = postNode
+				g[postNode.ID()].(*PostNode).neighbors[tag.ID()] = g[tag.ID()].(*TagNode)
 			}
-			g[tag.ID()].(*TagNode).neighbors[postNode.ID()] = postNode
-			g[postNode.ID()].(*PostNode).neighbors[tag.ID()] = g[tag.ID()].(*TagNode)
 		}
 	}
+	return nil
 }
