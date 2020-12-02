@@ -101,7 +101,7 @@ func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
 	queryGracePeriod := time.Hour // BigQuery needs time to update our tables
 	// TODO: subscribe to pub/sub notifications to know when to do the extraction task
 	if time.Now().Sub(attr.Updated) >= time.Hour * 24 + queryGracePeriod {
-		gcsRef := bq.NewGCSReference("gs://danbooru-px-tags/tags-*")
+		gcsRef := bq.NewGCSReference("gs://danbooru-px-tags/tags-*.json.gz")
 		gcsRef.Compression = bq.Gzip
 		gcsRef.DestinationFormat = bq.JSON
 		extractor := client.Dataset("danbooru_post_tags").Table("taggings").ExtractorTo(gcsRef)
