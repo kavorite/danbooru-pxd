@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"time"
 	"io"
+	"sync/atomic"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/storage"
@@ -14,8 +15,8 @@ import (
 )
 
 type IDType uint8
-type IDValue int
-type TagType string
+type IDValue int64
+type TagType uint8
 
 const (
 	idTypeTag = 0
@@ -33,22 +34,22 @@ type Node interface {
 }
 
 type Tag struct {
-	id IDValue      `json:"id"`
-	Name string     `json:"name"`
-	TagType         `json:"category"`
+	IDValue			`json:"id,string"`
+	TagType			`json:"category,string"`
+	Name string
 }
 
 func (tag *Tag) ID() ID {
-	return ID{tag.id, idTypeTag}
+	return ID{tag.IDValue, idTypeTag}
 }
 
 type Post struct {
-	id IDValue `json:"id"`
-	Tags []Tag `json:"tags"`
+	IDValue		`json:"id,string"`
+	Tags []Tag
 }
 
 func (post *Post) ID() ID {
-	return ID{post.id, idTypePost}
+	return ID{post.IDValue, idTypePost}
 }
 
 type TagNode struct {
@@ -111,7 +112,9 @@ func (bigraph *BiGraph) Load(ctx context.Context) *Error {
 		return err
 	}
 	var extraction *bq.Job
-	if time.Now().Sub(attr.Updated) >= time.Hour * 25 {
+	queryGracePeriod := time.Hour // BigQuery needs time to update our tables
+	// TODO: subscribe to pub/sub notifications to know when to do the extraction task
+	if time.Now().Sub(attr.Updated) >= time.Hour * 24 + queryGracePeriod {
 		gcsRef := bq.NewGCSReference("gs://danbooru-px-tags/tags-*")
 		gcsRef.Compression = bq.Gzip
 		gcsRef.DestinationFormat = bq.JSON
@@ -157,42 +160,70 @@ func (bigraph *BiGraph) Load(ctx context.Context) *Error {
 		}
 	}
 	// pull our archives out of storage
+	posts := make(chan Post)
+	errs := make(chan *Error, 1)
+	hydrating := int32(0)
 	for it := bkt.Objects(ctx, &storage.Query{Prefix: "tags-"});; {
 		attr, err := it.Next()
 		if err == iterator.Done {
 			break
 		}
-		if err := wrapError("resolve exported JSON blob handle", err); err != nil {
-			return err
-		}
-		blob := bkt.Object(attr.Name)
-		var istrm io.ReadCloser
-		istrm, err = blob.NewReader(ctx)
-		if err := wrapError("hydrate exported data", err); err != nil {
-			return err
-		}
-		defer istrm.Close()
-		istrm, err = gzip.NewReader(istrm)
-		if err := wrapError("hydrate exported data", err); err != nil {
-			return err
-		}
-		var post Post
-		for sc := bufio.NewScanner(istrm); sc.Scan(); {
-			err := wrapError("hydrate exported data", json.Unmarshal(sc.Bytes(), &post))
-			if err != nil {
-				return err
+		atomic.AddInt32(&hydrating, 1)
+		go func() {
+			if err := wrapError("resolve exported JSON blob handle", err); err != nil {
+				errs <- err
+				return
 			}
-			postNode := &PostNode{Post: post}
-			postNode.neighbors = make(map[ID]*TagNode, 128)
-			g[postNode.ID()] = postNode
-			for _, tag := range post.Tags {
-				if _, ok := g[tag.ID()].(*TagNode); !ok {
-					neighbors := make(map[ID]*PostNode, 1<<20)
-					g[tag.ID()] = &TagNode{tag, neighbors}
+			blob := bkt.Object(attr.Name)
+			var istrm io.ReadCloser
+			istrm, err = blob.NewReader(ctx)
+			if err := wrapError("hydrate exported data", err); err != nil {
+				errs <- err
+				return
+			}
+			defer istrm.Close()
+			istrm, err = gzip.NewReader(istrm)
+			if err := wrapError("hydrate exported data", err); err != nil {
+				errs <- err
+				return
+			}
+			for sc := bufio.NewScanner(istrm); sc.Scan(); {
+				post := Post{}
+				err := json.Unmarshal(sc.Bytes(), &post)
+				if err := wrapError("hydrate exported data", err); err != nil {
+					errs <- err
+					return
 				}
-				g[tag.ID()].(*TagNode).neighbors[postNode.ID()] = postNode
-				g[postNode.ID()].(*PostNode).neighbors[tag.ID()] = g[tag.ID()].(*TagNode)
+				posts <- post
 			}
+			if atomic.AddInt32(&hydrating, -1) == 0 {
+				close(posts)
+			}
+		}()
+	}
+	select {
+	case err := <-errs:
+		return err
+	default:
+		break
+	}
+	for post := range posts {
+		select {
+		case err := <-errs:
+			return err
+		default:
+			break
+		}
+		postNode := &PostNode{Post: post}
+		postNode.neighbors = make(map[ID]*TagNode, 128)
+		g[postNode.ID()] = postNode
+		for _, tag := range post.Tags {
+			if _, ok := g[tag.ID()].(*TagNode); !ok {
+				neighbors := make(map[ID]*PostNode, 1<<20)
+				g[tag.ID()] = &TagNode{tag, neighbors}
+			}
+			g[tag.ID()].(*TagNode).neighbors[postNode.ID()] = postNode
+			g[postNode.ID()].(*PostNode).neighbors[tag.ID()] = g[tag.ID()].(*TagNode)
 		}
 	}
 	return nil
