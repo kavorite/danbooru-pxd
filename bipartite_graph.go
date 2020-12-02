@@ -89,7 +89,7 @@ func (bigraph BiGraph) PostEdges(id int) (*PostNode, bool) {
 	return node.(*PostNode), true
 }
 
-func (bigraph *BiGraph) Load(ctx context.Context) *Error {
+func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
 	client, err := bq.NewClient(ctx, projectID)
 	if err := wrapError("init BigQuery client", err); err != nil {
 		return err
