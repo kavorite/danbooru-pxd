@@ -22,7 +22,6 @@ func (err *Error) Error() string {
 func (err *Error) FCk() {
 	if err != nil && err.cause != nil {
 		trace := errors.WrapPrefix(err.cause, err.operation, 0).ErrorStack()
-		trace = trace[len("*errors.ErrorString "):]
 		fmt.Fprintf(os.Stderr, "fatal: %s\n", trace)
 		os.Exit(1)
 	}
