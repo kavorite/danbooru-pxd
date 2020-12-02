@@ -8,5 +8,5 @@ const projectID = "danbooru-px"
 
 func main() {
 	var g *BiGraph
-	g.LoadPostGraph(context.Background()).FCk()
+	g.LoadPostTags(context.Background()).FCk()
 }
