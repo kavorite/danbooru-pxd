@@ -14,42 +14,9 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-type IDType uint8
-type IDValue int64
-type TagType uint8
-
-const (
-	idTypeTag = 0
-	idTypePost = iota
-)
-
-type ID struct {
-	IDValue
-	IDType
-}
-
 type Node interface {
 	ID() ID
 	Neighbors() []Node
-}
-
-type Tag struct {
-	IDValue			`json:"id,string"`
-	TagType			`json:"category,string"`
-	Name string
-}
-
-func (tag *Tag) ID() ID {
-	return ID{tag.IDValue, idTypeTag}
-}
-
-type Post struct {
-	IDValue		`json:"id,string"`
-	Tags []Tag
-}
-
-func (post *Post) ID() ID {
-	return ID{post.IDValue, idTypePost}
 }
 
 type TagNode struct {
