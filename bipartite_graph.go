@@ -89,6 +89,25 @@ func (bigraph BiGraph) PostEdges(id int) (*PostNode, bool) {
 	return node.(*PostNode), true
 }
 
+func (g BiGraph) TagPost(post Post) (degree int) {
+	if _, ok := g[post.ID()]; !ok {
+		postNode := &PostNode{Post: post}
+		postNode.neighbors = make(map[ID]*TagNode, 128)
+		g[postNode.ID()] = postNode
+	}
+	postNode := g[post.ID()].(*PostNode)
+	for _, tag := range post.Tags {
+		if _, ok := g[tag.ID()].(*TagNode); !ok {
+			neighbors := make(map[ID]*PostNode, 1<<20)
+			g[tag.ID()] = &TagNode{tag, neighbors}
+		}
+		g[tag.ID()].(*TagNode).neighbors[postNode.ID()] = postNode
+		g[postNode.ID()].(*PostNode).neighbors[tag.ID()] = g[tag.ID()].(*TagNode)
+	}
+	degree = len(post.Tags)
+	return
+}
+
 func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
 	client, err := bq.NewClient(ctx, projectID)
 	if err := wrapError("init BigQuery client", err); err != nil {
@@ -123,16 +142,6 @@ func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
 			}
 			return nil
 		}
-		postNode := &PostNode{Post: post}
-		postNode.neighbors = make(map[ID]*TagNode, 128)
-		g[postNode.ID()] = postNode
-		for _, tag := range post.Tags {
-			if _, ok := g[tag.ID()].(*TagNode); !ok {
-				neighbors := make(map[ID]*PostNode, 1<<20)
-				g[tag.ID()] = &TagNode{tag, neighbors}
-			}
-			g[tag.ID()].(*TagNode).neighbors[postNode.ID()] = postNode
-			g[postNode.ID()].(*PostNode).neighbors[tag.ID()] = g[tag.ID()].(*TagNode)
-		}
+		g.TagPost(post)
 	}
 }
