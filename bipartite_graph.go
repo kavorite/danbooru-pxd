@@ -40,7 +40,7 @@ func (post PostNode) Neighbors() (neighbors []Node) {
 
 type BiGraph map[ID]Node
 
-func (bigraph BiGraph) TagEdges(id int) (*TagNode, bool) {
+func (bigraph BiGraph) TagEdges(id IDValue) (*TagNode, bool) {
 	node, ok := bigraph[ID{id, idTypeTag}]
 	if !ok {
 		return nil, false
@@ -48,7 +48,7 @@ func (bigraph BiGraph) TagEdges(id int) (*TagNode, bool) {
 	return node.(*TagNode), true
 }
 
-func (bigraph BiGraph) PostEdges(id int) (*PostNode, bool) {
+func (bigraph BiGraph) PostEdges(id IDValue) (*PostNode, bool) {
 	node, ok := bigraph[ID{id, idTypePost}]
 	if !ok {
 		return nil, false

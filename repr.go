@@ -63,48 +63,45 @@ func (rating *Rating) UnmarshalJSON(payload []byte) error {
 	if string(payload) == "null" {
 		return nil
 	}
-	if len(payload) != 3 {
+	if len(payload) != 1 {
 		return fmt.Errorf("payload width mismatch")
-	}
-	r := byte(0)
-	if _, err := fmt.Sscanf(string(payload), `"%c"`, &r); err != nil {
-		return err
 	}
 	ratings := map[byte]Rating{
 		's': ratingSafe, 'q': ratingQuestionable, 'e': ratingExplicit,
 	}
-	if _, ok := ratings[r]; !ok {
+	r, ok := ratings[payload[0]]
+	if !ok {
 		return fmt.Errorf(
 			"invalid content-rating token '%c' " +
 			"(must be one of 's', 'q', or 'e')",
 			payload[0],
 		)
 	}
-	*rating = Rating(r)
+	*rating = r
 	return nil
 }
 
 type ID struct {
-	Value int
+	IDValue
 	IDType
 }
 
 type Tag struct {
-	id int
+	IDValue `json:"id,string"`
+	TagType `json:",string"`
 	Name string
-	TagType
 }
 
 func (tag *Tag) ID() ID {
-	return ID{tag.id, idTypeTag}
+	return ID{tag.IDValue, idTypeTag}
 }
 
 type Post struct {
-	id int
+	IDValue `json:"id,string"`
+	Rating `json:",string"`
 	Tags []Tag
-	Rating
 }
 
 func (post *Post) ID() ID {
-	return ID{post.id, idTypePost}
+	return ID{post.IDValue, idTypePost}
 }
