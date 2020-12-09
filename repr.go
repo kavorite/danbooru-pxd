@@ -8,8 +8,8 @@ type (
 )
 
 const (
-	idTypeTag = 0
-	idTypePost = iota
+	idTypeSilo = 0
+	idTypeAtom = iota
 )
 
 const (
@@ -50,7 +50,7 @@ type Tag struct {
 }
 
 func (tag *Tag) ID() ID {
-	return ID{tag.IDValue, idTypeTag}
+	return ID{tag.IDValue, idTypeSilo}
 }
 
 type Post struct {
@@ -60,5 +60,5 @@ type Post struct {
 }
 
 func (post *Post) ID() ID {
-	return ID{post.IDValue, idTypePost}
+	return ID{post.IDValue, idTypeAtom}
 }

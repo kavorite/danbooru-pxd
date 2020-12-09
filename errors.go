@@ -16,6 +16,9 @@ func (err *Error) Error() string {
 	if err == nil || err.cause == nil {
 		return error(nil).Error()
 	}
+	if err.operation == "" {
+		return err.cause.Error()
+	}
 	return fmt.Sprintf("%s: %s", err.operation, err.cause)
 }
 
