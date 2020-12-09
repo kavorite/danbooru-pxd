@@ -73,10 +73,10 @@ func (g BiGraphX) Nodes() graph.Nodes {
 func (g BiGraphX) From(n int64) graph.Nodes {
 	q := new(IDX)
 	q.id.PutInt64(n)
-	neighbors := g.BiGraph[q.id].Neighbors()
+	neighbors := g.Neighbors(q.id)
 	subgraph := make(BiGraph, len(neighbors))
-	for _, q := range neighbors {
-		subgraph[q.ID()] = nil
+	for _, id := range neighbors {
+		subgraph[id] = nil
 	}
 	return BiGraphX{subgraph}.Nodes()
 }
@@ -85,8 +85,8 @@ func (g BiGraphX) Edge(uid, vid int64) graph.Edge {
 	var p, q ID
 	p.PutInt64(uid)
 	q.PutInt64(vid)
-	for _, node := range g.BiGraph[p].Neighbors() {
-		if node.ID() == q {
+	for _, id := range g.Neighbors(p) {
+		if id == q {
 			return &BiGraphXEdge{from: IDX{p}, to: IDX{q}}
 		}
 	}

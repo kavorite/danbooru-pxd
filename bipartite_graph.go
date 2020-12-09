@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"math/rand"
 	"math"
+	"unsafe"
+	"sync"
 
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/storage"
@@ -21,83 +23,128 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-type Node interface {
-	ID() ID
-	Neighbors() []Node
+type EdgeSet map[ID]struct{}
+
+type BiGraph map[ID]EdgeSet
+
+func (g BiGraph) PlotNode(id ID) {
+	if _, ok := g[id]; ok {
+		return
+	}
+	g[id] = make(EdgeSet, 128)
 }
 
-type TagNode struct {
-	Tag
-	neighbors map[ID]*PostNode
+func (g BiGraph) Degree(id ID) int {
+	if _, ok := g[id]; !ok {
+		return 0
+	}
+	return len(g[id]) + 1
 }
 
-func (tn TagNode) Neighbors() (neighbors []Node) {
-	neighbors = make([]Node, 0, len(tn.neighbors))
-	for _, postNode := range tn.neighbors {
-		neighbors = append(neighbors, postNode)
+func (g BiGraph) AddEdge(p, q ID) {
+	g.PlotNode(p)
+	g.PlotNode(q)
+	g[p][q] = struct{}{}
+	g[q][p] = struct{}{}
+}
+
+func (g BiGraph) Neighbors(id ID) (nn []ID) {
+	nn = make([]ID, 0, len(g[id]))
+	for nid := range g[id] {
+		nn = append(nn, nid)
 	}
 	return
 }
 
-type PostNode struct {
-	Post
-	neighbors map[ID]*TagNode
+type PxGraph struct {
+	BiGraph
+	sync.RWMutex
+	maxDegrees map[IDType]int
 }
 
-func (post PostNode) Neighbors() (neighbors []Node) {
-	neighbors = make([]Node, 0, len(post.neighbors))
-	for _, tagNode := range post.neighbors {
-		neighbors = append(neighbors, tagNode)
+func (g *PxGraph) PlotNode(id ID) {
+	defer g.Unlock()
+	g.Lock()
+	g.PlotNode(id)
+}
+
+func (g *PxGraph) Degree(id ID) int {
+	defer g.RUnlock()
+	g.RLock()
+	return g.BiGraph.Degree(id)
+}
+
+func (g *PxGraph) Neighbors(id ID) []ID {
+	defer g.RUnlock()
+	g.RLock()
+	return g.BiGraph.Neighbors(id)
+}
+
+func (g *PxGraph) init() {
+	g.Lock()
+	defer g.Unlock()
+	if g.maxDegrees == nil {
+		keyspan := int(unsafe.Sizeof(IDValue(0)))
+		g.maxDegrees = make(map[IDType]int, keyspan)
 	}
-	return
 }
 
-type BiGraph map[ID]Node
-
-func (bigraph BiGraph) TagEdges(id IDValue) (*TagNode, bool) {
-	node, ok := bigraph[ID{id, idTypeTag}]
-	if !ok {
-		return nil, false
+func (g *PxGraph) AddEdge(p, q ID) {
+	g.init()
+	g.BiGraph.AddEdge(p, q)
+	g.Lock()
+	defer g.Unlock()
+	for _, id := range []ID{p, q} {
+		kind := id.IDType
+		if _, ok := g.maxDegrees[kind]; !ok {
+			g.maxDegrees[id.IDType] = 1
+		}
+		if d := g.Degree(p); d > g.maxDegrees[kind] {
+			g.maxDegrees[kind] = d
+		}
 	}
-	return node.(*TagNode), true
 }
 
-func (bigraph BiGraph) PostEdges(id IDValue) (*PostNode, bool) {
-	node, ok := bigraph[ID{id, idTypePost}]
-	if !ok {
-		return nil, false
-	}
-	return node.(*PostNode), true
-}
-
-func (bigraph BiGraph) NodeDegree(q ID) int {
-	node, ok := bigraph[q]
+func (g *PxGraph) MaxDegree(kind IDType) int {
+	g.init()
+	g.RLock()
+	defer g.RUnlock()
+	d, ok := g.maxDegrees[kind]
 	if !ok {
 		return 0
 	}
-	return len(node.Neighbors())
+	return d
 }
 
-func (g BiGraph) TagPost(post Post) (degree int) {
-	if _, ok := g[post.ID()]; !ok {
-		postNode := &PostNode{Post: post}
-		postNode.neighbors = make(map[ID]*TagNode, 128)
-		g[postNode.ID()] = postNode
-	}
-	postNode := g[post.ID()].(*PostNode)
+type PostGraph struct {
+	Posts map[ID]Post
+	Tags map[ID]Tag
+	PxGraph
+}
+
+func (postGraph *PostGraph) TagPost(post Post) {
+	postID := post.ID()
 	for _, tag := range post.Tags {
-		if _, ok := g[tag.ID()].(*TagNode); !ok {
-			neighbors := make(map[ID]*PostNode, 1<<20)
-			g[tag.ID()] = &TagNode{tag, neighbors}
-		}
-		g[tag.ID()].(*TagNode).neighbors[postNode.ID()] = postNode
-		g[postNode.ID()].(*PostNode).neighbors[tag.ID()] = g[tag.ID()].(*TagNode)
+		tagID := tag.ID()
+		postGraph.AddEdge(postID, tagID)
+		postGraph.Tags[tagID] = tag
 	}
-	degree = len(post.Tags)
-	return
+	postGraph.Posts[postID] = post
 }
 
-func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
+func runCountQuery(q bq.Query, ctx context.Context) (int64, error) {
+	it, err := q.Read(ctx)
+	if err != nil {
+		return -1, err
+	}
+	countRow := make([]bq.Value, 1)
+	if err = it.Next(&countRow); err != nil {
+		return -1, err
+	}
+	return countRow[0].(int64)
+}
+
+func (postGraph *PostGraph) LoadPostTags(ctx context.Context) *Error {
 	client, err := bq.NewClient(ctx, projectID)
 	if err := wrapError("init BigQuery client", err); err != nil {
 		return err
@@ -115,8 +162,8 @@ func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
 	var extraction *bq.Job
 	queryGracePeriod := time.Hour // BigQuery needs time to update our tables
 	// TODO: subscribe to pub/sub notifications to know when to do the extraction task
-	if time.Now().Sub(attr.Updated) >= time.Hour * 24 + queryGracePeriod {
-		gcsRef := bq.NewGCSReference("gs://danbooru-px-tags/tags-*")
+	if time.Since(attr.Updated) >= time.Hour * 24 + queryGracePeriod {
+		gcsRef := bq.NewGCSReference("gs://danbooru-px-tags/tags-*.json.gz")
 		gcsRef.Compression = bq.Gzip
 		gcsRef.DestinationFormat = bq.JSON
 		extractor := client.Dataset("danbooru_post_tags").Table("taggings").ExtractorTo(gcsRef)
@@ -127,24 +174,35 @@ func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
 			return err
 		}
 	}
-	var g BiGraph
-	if bigraph == nil {
+	g := PostGraph{}
+	if postGraph == nil {
 		q := client.Query("SELECT COUNT(id) from `danbooru-px.danbooru_post_tags.taggings`")
-		it, err := q.Read(ctx)
+		postc, err := runCountQuery(q)
 		if err := wrapError("count posts", err); err != nil {
 			return err
 		}
-		countRow := make([]bq.Value, 1)
-		if err := wrapError("count posts", it.Next(&countRow)); err != nil {
+		q = client.Query(`
+			WITH labels AS (
+			  WITH tags AS (
+			    SELECT tags FROM ` + "`danbooru-data.danbooru.posts`" + `
+			  SELECT DISTINCT name FROM tags tag
+			  CROSS JOIN UNNEST(tags))
+			SELECT COUNT(name) FROM labels
+		`, client, ctx)
+		tagc, err := runCountQuery(q, ctx)
+		if err := wrapError("count unique tags", err); err != nil {
 			return err
 		}
-		postc := countRow[0].(int64)
-		g = make(BiGraph, postc)
-		bigraph = &g
+		postGraph = &PostGraph{
+			Posts: make(map[ID]Post, int(postc)),
+			Tags: make(map[ID]Tag, int(tagc)),
+			PxGraph: PxGraph{BiGraph: make(BiGraph, int(postc + tagc))},
+		}
 	}
-	g = *bigraph
-	// hurry up and wait for extraction to complete
+	g = *postGraph
+	// if extraction initiated...
 	if extraction != nil {
+		// hurry up and wait for GCS extraction to complete
 		for {
 			<-time.After(time.Second*10)
 			status, err := extraction.Status(ctx)
@@ -160,7 +218,7 @@ func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
 			break
 		}
 	}
-	// pull our archives out of storage
+	// pull our archives out of GCS
 	posts := make(chan Post)
 	errs := make(chan *Error, 1)
 	hydrating := int32(0)
@@ -220,63 +278,51 @@ func (bigraph *BiGraph) LoadPostTags(ctx context.Context) *Error {
 	return nil
 }
 
-type PxGraph struct {
-	BiGraph
-	MaxPostDegree int
-}
-
-func (g PxGraph) TagPost(post Post) {
-	if d := g.BiGraph.TagPost(post); d > g.MaxPostDegree {
-		g.MaxPostDegree = d
-	}
-}
-
 type PxQuery struct {
 	Ratings map[ID]float64
+	ReturnTypes map[IDType]struct{}
 	MaxVisitsPerWalk int
 	MaxTotalVisits int
-	ReturnPosts bool
-	ReturnTags bool
-	centrality map[ID]float64
 }
 
-func (px *PxQuery) computeCentrality(g PxGraph) (centrality map[ID]float64) {
-	// compute the betweenness centrality of each tag amongst the query points to derive its rating
-	subset := make(BiGraph, len(px.Ratings))
-	for q := range px.Ratings {
-		node := g.BiGraph[q]
-		subset[q] = node
-	}
-	betweenness := network.Betweenness(&BiGraphX{subset})
-	centrality = make(map[ID]float64, len(betweenness))
-	maxCentrality := 0.0
-	var q ID
-	for id, score := range betweenness {
-		q.PutInt64(id)
-		centrality[q] = score
-		maxCentrality = math.Max(maxCentrality, score)
-	}
-	for q := range centrality {
-		centrality[q] /= maxCentrality
-	}
-	return
+func (px *PxQuery) WithRatings(ratings map[ID]float64) *PxQuery {
+	px.Ratings = ratings
+	return px
 }
 
-func (px *PxQuery) PersonalizedNeighbor(q ID, g PxGraph) Node {
-	neighbors := g.BiGraph[q].Neighbors()
-	if px.centrality == nil {
-		px.centrality = px.computeCentrality(g)
+func (px *PxQuery) WithReturnTypes(types ...IDType) *PxQuery {
+	px.ReturnTypes = make(map[IDType]struct{}, len(types))
+	for _, kind := range types {
+		px.ReturnTypes[kind] = struct{}{}
 	}
+	return px
+}
+
+func (px *PxQuery) WithMaxWalkVisits(n int) *PxQuery {
+	px.MaxTotalVisits = n
+	return px
+}
+
+func (px *PxQuery) WithMaxTotalVisits(n int) *PxQuery {
+	px.MaxTotalVisits = n
+	return px
+}
+
+func (px *PxQuery) PersonalizedNeighbor(q ID, g PxGraph) ID {
+	neighbors := g.Neighbors(q)
 	rand.Shuffle(len(neighbors), func(i, j int) {
 		neighbors[i], neighbors[j] = neighbors[j], neighbors[i]
 	})
 	goal := rand.Float64() * float64(len(neighbors))
 	i := 0
 	for {
-		node := neighbors[i]
-		goal -= (px.centrality[node.ID()] + 1.0) * px.Ratings[q]
+		siblingID := neighbors[i]
+		degree := math.Abs(float64(g.Degree(siblingID)))
+		maxDegree := math.Abs(float64(g.MaxDegree(siblingID.IDType)))
+		degree /= maxDegree
+		goal -= (degree + 1.0) * px.Ratings[q]
 		if goal < 0 {
-			return node
+			return siblingID
 		}
 		i++
 		if i == len(neighbors) {
@@ -286,8 +332,8 @@ func (px *PxQuery) PersonalizedNeighbor(q ID, g PxGraph) Node {
 }
 
 func (px *PxQuery) QueryScalingFactor(q ID, g PxGraph) (weight float64) {
-	c := math.Abs(float64(g.MaxPostDegree))
-	n := math.Abs(float64(len(g.BiGraph[q].Neighbors())))
+	c := math.Abs(float64(g.MaxDegree(q.IDType)))
+	n := math.Abs(float64(g.Degree(q)))
 	weight = n * (c - math.Log(n))
 	return
 }
@@ -320,21 +366,21 @@ func (px *PxQuery) SampleWalkLengths(g PxGraph) (stepCounts map[ID]float64) {
 
 // TODO: early stopping
 func (px *PxQuery) RunAgainst(g PxGraph) (recommendations map[ID]float64) {
-	defer func() {
-		px.centrality = nil
-	}()
-	maxPostDegree := float64(g.MaxPostDegree)
-	expectedResults := math.Ceil(math.Log(maxPostDegree))
+	expectedResults := math.Ceil(math.Log(math.Abs(float64(g.MaxDegree(idTypeAtom)))))
 	recommendations = make(map[ID]float64, len(px.Ratings))
 	for q, stepc := range px.SampleWalkLengths(g) {
 		visits := make(map[ID]float64, int(expectedResults * 1.5))
 		for i := 0; i < int(stepc); i++ {
-			q = px.PersonalizedNeighbor(q, g).ID()
-			if (!px.ReturnTags && q.IDType != idTypePost) {
-			 	q = px.PersonalizedNeighbor(q, g).ID()
-			}
-			if (!px.ReturnPosts && q.IDType != idTypeTag) {
-				q = px.PersonalizedNeighbor(q, g).ID()
+			q = px.PersonalizedNeighbor(q, g)
+			for {
+				if px.ReturnTypes == nil {
+					break
+				}
+				if _, ok := px.ReturnTypes[q.IDType]; !ok {
+					q = px.PersonalizedNeighbor(q, g)
+					continue
+				}
+				break
 			}
 			if _, ok := visits[q]; !ok {
 				visits[q] = 0
@@ -345,11 +391,11 @@ func (px *PxQuery) RunAgainst(g PxGraph) (recommendations map[ID]float64) {
 			if _, ok := recommendations[q]; !ok {
 				recommendations[q] = 0
 			}
-			recommendations[q] += math.Sqrt(k)
+			recommendations[q] += k*k
 		}
 	}
 	for q := range recommendations {
-		recommendations[q] *= recommendations[q]
+		recommendations[q] = math.Sqrt(recommendations[q])
 	}
 	return
 }
