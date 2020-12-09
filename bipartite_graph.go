@@ -16,7 +16,6 @@ import (
 	bq "cloud.google.com/go/bigquery"
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
-	"gonum.org/v1/gonum/graph/network"
 )
 
 func init() {
